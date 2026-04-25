@@ -1,0 +1,4 @@
+# TEST FIXTURE — pinned to versions with known CVEs so the OSV check can flag them.
+requests==2.19.0
+jinja2==2.10
+pyyaml==5.3
