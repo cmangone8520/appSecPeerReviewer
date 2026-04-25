@@ -41,6 +41,12 @@ _REQ_RE = re.compile(r"^\s*([A-Za-z0-9_.\-]+)\s*==\s*([0-9][^\s;#]*)")
 _PYPROJECT_RE = re.compile(r"\"([A-Za-z0-9_.\-]+)==([0-9][^\"\s]*)\"")
 _NPM_RE = re.compile(r'"([@A-Za-z0-9_./\-]+)"\s*:\s*"((?:\^|~|=)?)([0-9][^"]+)"')
 
+# Match any pip requirements-style file: requirements.txt, requirements-dev.txt,
+# requirements-test.txt, requirements/prod.txt, requirements_extra.txt, etc.
+# We only care about the basename and extension; the directory is handled by
+# the path-suffix lookup in extract_added_deps.
+_REQ_FILE_RE = re.compile(r"(^|/)requirements([_\-./][^/]*)?\.txt$")
+
 
 def extract_added_deps(files: list[FileDiff]) -> list[DepRef]:
     deps: list[DepRef] = []
@@ -48,7 +54,7 @@ def extract_added_deps(files: list[FileDiff]) -> list[DepRef]:
         if f.is_binary or not f.path:
             continue
         path = f.path.lower()
-        is_py_req = path.endswith("requirements.txt") or path.endswith("requirements-dev.txt")
+        is_py_req = bool(_REQ_FILE_RE.search(path))
         is_pyproject = path.endswith("pyproject.toml")
         is_pkgjson = path.endswith("package.json")
         if not (is_py_req or is_pyproject or is_pkgjson):
