@@ -1,4 +1,4 @@
-from app.diff_parser import is_added_line, parse_diff
+from app.diff import is_added_line, parse_diff
 
 DIFF = """diff --git a/app/main.py b/app/main.py
 index 1111111..2222222 100644

@@ -1,5 +1,5 @@
-from app.diff_parser import parse_diff
-from app.review.secrets import scan
+from app.diff import parse_diff
+from app.review.reviewers.secrets import scan
 
 DIFF_WITH_SECRETS = """diff --git a/config.py b/config.py
 index 1..2 100644

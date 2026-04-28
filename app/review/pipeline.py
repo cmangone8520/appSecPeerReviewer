@@ -1,85 +1,131 @@
-"""Top-level review orchestration.
+"""Review pipeline orchestrator.
 
-Given a unified diff, run the LLM reviewer + secret scan + dep CVE
-lookup in parallel, dedupe overlapping findings, and return the
-combined list ready to post as inline PR comments.
+:class:`ReviewPipeline` fans out to all registered reviewer plugins in
+parallel, collects their findings, deduplicates overlapping results, and
+returns the final sorted list ready for posting as GitHub inline comments.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from ..config import Settings
-from ..diff_parser import parse_diff
+from ..diff.parser import parse_diff
 from ..models import Finding
-from . import deps as deps_mod
-from . import llm as llm_mod
-from . import secrets as secrets_mod
+from .base import ReviewContext
+from .registry import ReviewerRegistry
+from .review_utils import _SEVERITY_RANK, dedupe_findings, summary_body
 
-log = logging.getLogger(__name__)
-
-_SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+log = logging.getLogger("appsec_reviewer")
 
 
-async def run_review(settings: Settings, diff_text: str) -> list[Finding]:
-    if not diff_text.strip():
-        return []
-    parsed = parse_diff(diff_text)
-    if not parsed:
-        return []
-
-    llm_task = llm_mod.review_diff(settings, diff_text, parsed)
-    osv_task = deps_mod.query_osv(deps_mod.extract_added_deps(parsed))
-    secret_findings = secrets_mod.scan(parsed)
-
-    llm_findings, dep_findings = await asyncio.gather(llm_task, osv_task, return_exceptions=True)
-
-    findings: list[Finding] = list(secret_findings)
-    if isinstance(llm_findings, Exception):
-        log.warning("LLM review failed: %s", llm_findings)
-    else:
-        findings.extend(llm_findings)
-    if isinstance(dep_findings, Exception):
-        log.warning("Dep CVE check failed: %s", dep_findings)
-    else:
-        findings.extend(dep_findings)
-
-    return _dedupe(findings)
+# ---------------------------------------------------------------------------
+# Pipeline class
+# ---------------------------------------------------------------------------
 
 
-def _dedupe(findings: list[Finding]) -> list[Finding]:
-    """Collapse same (file, line, vuln_class), keeping the highest severity."""
-    by_key: dict[tuple[str, int, str], Finding] = {}
-    for f in findings:
-        key = (f.file, f.line, f.vulnerability_class)
-        prev = by_key.get(key)
-        if prev is None or _SEVERITY_RANK[f.severity] > _SEVERITY_RANK[prev.severity]:
-            by_key[key] = f
-    out = list(by_key.values())
-    out.sort(
-        key=lambda f: (-_SEVERITY_RANK[f.severity], f.file, f.line),
-    )
-    return out
+class ReviewPipeline:
+    """Orchestrates all registered :class:`~app.review.base.Reviewer` plugins.
 
+    Parameters
+    ----------
+    registry:
+        The :class:`~app.review.registry.ReviewerRegistry` whose reviewers will
+        be invoked for every call to :meth:`run`.
+    """
 
-def summary_body(findings: list[Finding]) -> str:
-    if not findings:
-        return (
-            "**appSec Peer Reviewer**\n\n"
-            "No security findings on this diff. "
-            "(Reviewed via OpenAI + secret scan + OSV CVE check.)"
+    def __init__(self, registry: ReviewerRegistry) -> None:
+        self._registry = registry
+
+    async def run(
+        self,
+        settings: Settings,
+        diff_text: str,
+        delivery_id: str = "-",
+    ) -> list[Finding]:
+        """Run all registered reviewers against *diff_text* and return findings.
+
+        Reviewers are launched concurrently via :func:`asyncio.gather`.  If one
+        reviewer raises, the error is logged and the other reviewers' results
+        are still returned — a single reviewer failure is non-fatal.
+
+        Parameters
+        ----------
+        settings:
+            Runtime config forwarded to each reviewer via :class:`ReviewContext`.
+        diff_text:
+            The raw unified diff string.
+        delivery_id:
+            The GitHub delivery-id for log correlation.
+
+        Returns
+        -------
+        list[Finding]
+            Deduplicated, severity-sorted findings.
+        """
+        started = time.perf_counter()
+        log.info(
+            "pipeline start diff_bytes=%d reviewers=%d delivery=%s",
+            len(diff_text.encode()),
+            len(self._registry),
+            delivery_id,
         )
-    counts: dict[str, int] = {}
-    for f in findings:
-        counts[f.severity] = counts.get(f.severity, 0) + 1
-    pieces = [
-        f"{n} {sev}"
-        for sev, n in sorted(counts.items(), key=lambda kv: -_SEVERITY_RANK[kv[0]])
-    ]
-    return (
-        "**appSec Peer Reviewer**\n\n"
-        f"Found {len(findings)} potential security issue(s): {', '.join(pieces)}. "
-        "See inline comments. Each finding is one of: LLM-detected (OWASP/auth/crypto), "
-        "secret-scan (regex on added lines), or dependency-cve (OSV.dev lookup on pinned versions)."
-    )
+
+        if not diff_text.strip():
+            log.info("pipeline skip: empty diff delivery=%s", delivery_id)
+            return []
+
+        parsed = parse_diff(diff_text)
+        if not parsed:
+            log.info("pipeline skip: no parsed files delivery=%s", delivery_id)
+            return []
+
+        ctx = ReviewContext(
+            diff_text=diff_text,
+            parsed=parsed,
+            settings=settings,
+            delivery_id=delivery_id,
+        )
+
+        # Fan-out: run all reviewers concurrently.
+        results = await asyncio.gather(
+            *[reviewer.review(ctx) for reviewer in self._registry],
+            return_exceptions=True,
+        )
+
+        all_findings: list[Finding] = []
+        for reviewer, result in zip(self._registry, results, strict=True):
+            if isinstance(result, Exception):
+                log.warning(
+                    "reviewer failed reviewer=%s delivery=%s error=%s",
+                    reviewer.name,
+                    delivery_id,
+                    result,
+                )
+            else:
+                log.info(
+                    "reviewer complete reviewer=%s findings=%d delivery=%s",
+                    reviewer.name,
+                    len(result),
+                    delivery_id,
+                )
+                all_findings.extend(result)
+
+        deduped = dedupe_findings(all_findings)
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        log.info(
+            "pipeline complete before_dedupe=%d after_dedupe=%d "
+            "elapsed_ms=%d delivery=%s",
+            len(all_findings),
+            len(deduped),
+            elapsed_ms,
+            delivery_id,
+        )
+        return deduped
+
+
+# Backward-compatible exports used by tests/importers.
+def _dedupe(findings: list[Finding]) -> list[Finding]:
+    return dedupe_findings(findings)
