@@ -1,5 +1,5 @@
-from app.diff_parser import parse_diff
-from app.review.deps import extract_added_deps
+from app.diff import parse_diff
+from app.review.reviewers.deps import extract_added_deps
 
 REQ_DIFF = """diff --git a/requirements.txt b/requirements.txt
 index 1..2 100644
