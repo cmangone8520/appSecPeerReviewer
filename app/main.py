@@ -20,8 +20,6 @@ from __future__ import annotations
 
 import json
 import logging
-import time
-from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -35,34 +33,6 @@ from .review.tasks import run_review_safe
 from .webhook import verify_signature
 
 log = logging.getLogger("appsec_reviewer")
-_DELIVERY_CACHE: OrderedDict[str, float] = OrderedDict()
-
-
-def _cleanup_delivery_cache(now: float) -> None:
-    while _DELIVERY_CACHE:
-        first_key = next(iter(_DELIVERY_CACHE))
-        if _DELIVERY_CACHE[first_key] > now:
-            break
-        _DELIVERY_CACHE.pop(first_key, None)
-
-
-def _mark_delivery_seen(
-    delivery_id: str,
-    *,
-    now: float,
-    ttl_seconds: int,
-    max_entries: int,
-) -> bool:
-    _cleanup_delivery_cache(now)
-    expiry = _DELIVERY_CACHE.get(delivery_id)
-    if expiry and expiry > now:
-        return True
-
-    _DELIVERY_CACHE[delivery_id] = now + ttl_seconds
-    _DELIVERY_CACHE.move_to_end(delivery_id)
-    while len(_DELIVERY_CACHE) > max_entries:
-        _DELIVERY_CACHE.popitem(last=False)
-    return False
 
 # ---------------------------------------------------------------------------
 # Lifespan — startup / shutdown
@@ -133,14 +103,6 @@ async def webhook(
 
     delivery_id = x_github_delivery or "unknown"
     set_delivery_id(delivery_id)
-    if x_github_delivery and _mark_delivery_seen(
-        x_github_delivery,
-        now=time.monotonic(),
-        ttl_seconds=settings.webhook_replay_ttl_seconds,
-        max_entries=settings.webhook_replay_cache_size,
-    ):
-        log.info("webhook ignored: duplicate delivery_id=%s", x_github_delivery)
-        return {"status": "ignored duplicate delivery"}
 
     log.info(
         "webhook received event=%s body_bytes=%d",
@@ -160,6 +122,7 @@ async def webhook(
     if x_github_event == "ping":
         log.info("webhook ping acknowledged")
         return {"status": "pong"}
+
     if x_github_event != "pull_request":
         log.info("webhook ignored: event=%s", x_github_event)
         return {"status": f"ignored event={x_github_event}"}
@@ -168,18 +131,17 @@ async def webhook(
         payload = json.loads(body)
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="invalid json payload") from None
-    action = payload.get("action")
 
-    _actionable = {"opened", "synchronize", "reopened", "ready_for_review"}
-    if action not in _actionable:
+    action = payload.get("action")
+    if action != "opened":
         log.info("webhook ignored: action=%s", action)
         return {"status": f"ignored action={action}"}
-    if payload.get("pull_request", {}).get("draft"):
-        log.info("webhook ignored: draft pull request")
-        return {"status": "ignored draft PR"}
 
-    pr = payload["pull_request"]
-    repo = payload["repository"]
+    pr = payload.get("pull_request")
+    repo = payload.get("repository")
+    if not pr or not repo:
+        log.info("webhook ignored: no pull_request data in event=%s", x_github_event)
+        return {"status": f"ignored event={x_github_event} (no PR data)"}
     installation_id = payload.get("installation", {}).get("id")
     if not installation_id:
         log.warning("webhook rejected: missing installation.id")
