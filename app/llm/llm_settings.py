@@ -21,9 +21,11 @@ class LLMSettings(BaseSettings):
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4o", alias="OPENAI_MODEL")
     openai_http_timeout: float = Field(
-        default=30.0,
+        default=300.0,
         alias="OPENAI_HTTP_TIMEOUT",
-        description="Timeout (seconds) for each OpenAI completion request.",
+        description="Timeout (seconds) for each OpenAI completion request. "
+                    "Reasoning models (gpt-5, o1, o3, o4-mini) can take 60-180s; "
+                    "set to 0 to disable the timeout entirely.",
     )
     openai_max_output_tokens: int = Field(
         default=4096,
